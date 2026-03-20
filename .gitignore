@@ -26,3 +26,4 @@ Thumbs.db
 
 # User config (keep template)
 config.local.json
+.env

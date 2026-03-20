@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Voice Typer v3.3 - 玻璃透明版
+Voice Typer v3.5 - 玻璃透明版 + Get笔记
 按住左 Alt 说话，松开自动打字
-玻璃半透明窗口 + 圆角 + 黑色文字
-修复: 右Alt误触发 + 双屏幕重复显示
+按住 Alt + V 说话，松开保存到 Get笔记
 """
 
 import os
@@ -14,17 +13,61 @@ import threading
 import time
 import ctypes
 import tempfile
+import json
+import urllib.request
+import urllib.error
 from pathlib import Path
+from datetime import datetime
 from ctypes import windll, c_int, byref, sizeof, c_ulong, c_short
+
+# ========== 单实例检查 ==========
+def check_single_instance():
+    """确保只有一个实例运行"""
+    import socket
+    lock_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        lock_socket.bind(('127.0.0.1', 51234))
+        return lock_socket
+    except:
+        print("[ERR] 已有 Voice Typer 在运行")
+        sys.exit(1)
+
+# 单实例锁
+_instance_lock = check_single_instance()
 
 # Windows 虚拟键码
 VK_LMENU = 0xA4  # 左 Alt
 VK_RMENU = 0xA5  # 右 Alt
+VK_V = 0x56      # V 键
 
 # 修复 Windows 控制台编码
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# Get笔记 API 配置 (从 .env 文件或环境变量读取)
+def load_getnote_config():
+    """加载 Get笔记 API 配置"""
+    # 尝试从 .env 文件加载
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").strip().split("\n"):
+            if "=" in line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "GETNOTE_API_KEY":
+                    os.environ[key] = value
+                elif key == "GETNOTE_CLIENT_ID":
+                    os.environ[key] = value
+
+    return (
+        os.environ.get("GETNOTE_API_KEY", ""),
+        os.environ.get("GETNOTE_CLIENT_ID", "")
+    )
+
+GETNOTE_API_KEY, GETNOTE_CLIENT_ID = load_getnote_config()
+GETNOTE_API_URL = "https://openapi.biji.com"
 
 # 配置
 SAMPLE_RATE = 16000
@@ -38,32 +81,40 @@ class State:
     is_recording = False
     audio_data = []
     stream = None
-    last_key_state = False
+    last_key_state = False  # 左 Alt
+    last_alt_v_state = False  # Alt + V
     record_start_time = None
     running = True
     status_text = ""
-    status_color = (50, 50, 50)  # 深灰色文字
+    status_color = (50, 50, 50)
     window_visible = False
     hwnd = None
     processing = False
-    hwnd_set = False  # 窗口句柄是否已设置
+    hwnd_set = False
+    note_mode = False  # 是否为笔记模式
 
 state = State()
 
 
-# ========== 左 Alt 精确检测 (Windows API) ==========
+# ========== 按键检测 (Windows API) ==========
 def is_left_alt_pressed():
     """使用 Windows API 精确检测左 Alt 键状态"""
-    # GetAsyncKeyState 返回键状态
-    # 最高位为1表示键被按下，最低位为1表示自上次调用后键被按过
     result = windll.user32.GetAsyncKeyState(VK_LMENU)
-    # 检查最高位是否为1 (键当前被按下)
     return result & 0x8000 != 0
 
 def is_right_alt_pressed():
     """检测右 Alt 键状态"""
     result = windll.user32.GetAsyncKeyState(VK_RMENU)
     return result & 0x8000 != 0
+
+def is_v_pressed():
+    """检测 V 键状态"""
+    result = windll.user32.GetAsyncKeyState(VK_V)
+    return result & 0x8000 != 0
+
+def is_alt_v_pressed():
+    """检测 Alt + V 组合键"""
+    return is_left_alt_pressed() and not is_right_alt_pressed() and is_v_pressed()
 
 
 # ========== 小龙虾绘制 ==========
@@ -437,6 +488,7 @@ def type_text(text):
 
 
 def process_audio(audio_path):
+    """普通模式：识别后打字"""
     if state.processing:
         return
 
@@ -461,13 +513,158 @@ def process_audio(audio_path):
         state.processing = False
 
 
+# ========== Get笔记 API ==========
+# 语音笔记知识库 ID (可在 Get笔记 App 中查看)
+VOICE_NOTE_TOPIC_ID = "EJXjKbqY"  # "语音笔记" 知识库
+
+def save_to_getnote(text):
+    """保存文字到 Get笔记"""
+    if not GETNOTE_API_KEY or not GETNOTE_CLIENT_ID:
+        print("[WARN] Get笔记 API 未配置")
+        return False, "API未配置"
+
+    try:
+        # 生成标题（取前20字）
+        title = text[:20] + "..." if len(text) > 20 else text
+        title = title.replace("\n", " ").strip()
+
+        # 提取标签（#开头的词）
+        tags = []
+        import re
+        tag_matches = re.findall(r'#(\S+)', text)
+        if tag_matches:
+            tags = tag_matches[:5]  # 最多5个标签
+
+        data = {
+            "title": title,
+            "content": text,
+            "note_type": "plain_text",
+            "tags": tags
+        }
+
+        req = urllib.request.Request(
+            f"{GETNOTE_API_URL}/open/api/v1/resource/note/save",
+            data=json.dumps(data).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": GETNOTE_API_KEY,
+                "X-Client-ID": GETNOTE_CLIENT_ID
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw_data = response.read().decode("utf-8")
+            result = json.loads(raw_data)
+
+            if result.get("success"):
+                print(f"[OK] 已保存到 Get笔记: {title}")
+
+                # 获取 note_id (64位整数，用正则提取避免精度丢失)
+                # API 返回的字段可能是 "id" 或 "note_id"
+                note_id_match = re.search(r'"(?:note_)?id"\s*:\s*(\d+)', raw_data)
+                note_id = int(note_id_match.group(1)) if note_id_match else None
+
+                print(f"[DEBUG] note_id: {note_id}")
+
+                # 添加到知识库
+                if note_id and VOICE_NOTE_TOPIC_ID:
+                    add_note_to_topic(note_id, VOICE_NOTE_TOPIC_ID)
+
+                return True, title
+            else:
+                error = result.get("error", {})
+                print(f"[ERR] Get笔记保存失败: {error.get('message', 'unknown')}")
+                return False, error.get("message", "保存失败")
+
+    except Exception as e:
+        print(f"[ERR] Get笔记 API 错误: {e}")
+        return False, str(e)
+
+
+def add_note_to_topic(note_id, topic_id):
+    """将笔记添加到知识库"""
+    try:
+        data = {
+            "topic_id": topic_id,
+            "note_ids": [int(note_id)]
+        }
+
+        req = urllib.request.Request(
+            f"{GETNOTE_API_URL}/open/api/v1/resource/knowledge/note/batch-add",
+            data=json.dumps(data).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": GETNOTE_API_KEY,
+                "X-Client-ID": GETNOTE_CLIENT_ID
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            if result.get("success"):
+                print(f"[OK] 已添加到知识库")
+            else:
+                print(f"[WARN] 添加到知识库失败: {result.get('error', {}).get('message', '')}")
+
+    except Exception as e:
+        print(f"[WARN] 添加到知识库异常: {e}")
+
+
+def process_audio_for_note(audio_path):
+    """笔记模式：识别后保存到 Get笔记"""
+    if state.processing:
+        return
+
+    state.processing = True
+    try:
+        text = recognize(audio_path)
+        if text:
+            text = add_punctuation(text)
+            display = text[:15] + "..." if len(text) > 15 else text
+            show_status(f"📝 {display}", (100, 100, 200))
+            play_beep(800, 80)
+
+            # 保存到 Get笔记
+            success, msg = save_to_getnote(text)
+
+            if success:
+                show_status(f"✅ 笔记已保存", (50, 150, 50))
+                play_beep(1000, 50)
+                play_beep(1200, 80)
+            else:
+                show_status(f"❌ {msg[:10]}", (200, 50, 50))
+                play_beep(400, 200)
+
+            time.sleep(1.5)
+            hide_status()
+        else:
+            show_status("❌ 识别失败", (200, 50, 50))
+            play_beep(400, 200)
+            time.sleep(1)
+            hide_status()
+    finally:
+        state.processing = False
+        state.note_mode = False
+
+
 def main():
     print("=" * 50)
-    print("Voice Typer v3.3 (玻璃透明版)")
+    print("Voice Typer v3.5 (玻璃透明版 + Get笔记 + 单实例)")
     print("=" * 50)
     print()
-    print("快捷键: 按住 左Alt 说话，松开识别")
-    print("按 ESC 退出")
+    print("快捷键:")
+    print("  左 Alt    → 语音打字")
+    print("  Alt + V   → 语音存笔记 (Get笔记)")
+    print("  ESC       → 退出")
+    print()
+
+    # 检查 Get笔记配置
+    if GETNOTE_API_KEY:
+        print(f"[OK] Get笔记 API 已配置")
+    else:
+        print("[WARN] Get笔记 API 未配置 (设置 GETNOTE_API_KEY 环境变量)")
     print()
 
     # 启动 pygame 窗口线程
@@ -478,11 +675,11 @@ def main():
     time.sleep(0.5)
 
     print("[OK] 玻璃窗口已启动")
-    print("[OK] 快捷键监听已启动 (Windows API 精确检测左Alt)")
+    print("[OK] 快捷键监听已启动")
 
     import keyboard
 
-    # 主循环 - 使用 Windows API 检测左 Alt
+    # 主循环
     while state.running:
         try:
             # 检测 ESC 退出
@@ -491,21 +688,35 @@ def main():
                 state.running = False
                 os._exit(0)
 
-            # 精确检测左 Alt (排除右 Alt)
+            # 检测 Alt + V (笔记模式) - 优先检测
+            alt_v = is_alt_v_pressed()
             left_alt = is_left_alt_pressed()
             right_alt = is_right_alt_pressed()
 
-            # 只响应左 Alt 按下，且右 Alt 未按下
-            if left_alt and not right_alt:
-                if not state.last_key_state:
-                    state.last_key_state = True
+            if alt_v:
+                # Alt + V 笔记模式
+                if not state.last_alt_v_state:
+                    state.last_alt_v_state = True
+                    state.note_mode = True
                     start_recording()
             else:
-                if state.last_key_state:
-                    state.last_key_state = False
+                if state.last_alt_v_state:
+                    state.last_alt_v_state = False
                     audio_path = stop_recording()
                     if audio_path:
-                        threading.Thread(target=process_audio, args=(audio_path,), daemon=True).start()
+                        threading.Thread(target=process_audio_for_note, args=(audio_path,), daemon=True).start()
+                # 单独左 Alt (打字模式) - 排除 Alt+V
+                elif left_alt and not right_alt and not is_v_pressed():
+                    if not state.last_key_state:
+                        state.last_key_state = True
+                        state.note_mode = False
+                        start_recording()
+                else:
+                    if state.last_key_state and not state.note_mode:
+                        state.last_key_state = False
+                        audio_path = stop_recording()
+                        if audio_path:
+                            threading.Thread(target=process_audio, args=(audio_path,), daemon=True).start()
 
             time.sleep(0.02)  # 50Hz 检测频率
 
