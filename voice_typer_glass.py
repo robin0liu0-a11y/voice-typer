@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Voice Typer v3.2 - 玻璃透明版
+Voice Typer v3.3 - 玻璃透明版
 按住左 Alt 说话，松开自动打字
 玻璃半透明窗口 + 圆角 + 黑色文字
+修复: 右Alt误触发 + 双屏幕重复显示
 """
 
 import os
@@ -14,7 +15,11 @@ import time
 import ctypes
 import tempfile
 from pathlib import Path
-from ctypes import windll, c_int, byref, sizeof, c_ulong
+from ctypes import windll, c_int, byref, sizeof, c_ulong, c_short
+
+# Windows 虚拟键码
+VK_LMENU = 0xA4  # 左 Alt
+VK_RMENU = 0xA5  # 右 Alt
 
 # 修复 Windows 控制台编码
 if sys.platform == "win32":
@@ -41,8 +46,24 @@ class State:
     window_visible = False
     hwnd = None
     processing = False
+    hwnd_set = False  # 窗口句柄是否已设置
 
 state = State()
+
+
+# ========== 左 Alt 精确检测 (Windows API) ==========
+def is_left_alt_pressed():
+    """使用 Windows API 精确检测左 Alt 键状态"""
+    # GetAsyncKeyState 返回键状态
+    # 最高位为1表示键被按下，最低位为1表示自上次调用后键被按过
+    result = windll.user32.GetAsyncKeyState(VK_LMENU)
+    # 检查最高位是否为1 (键当前被按下)
+    return result & 0x8000 != 0
+
+def is_right_alt_pressed():
+    """检测右 Alt 键状态"""
+    result = windll.user32.GetAsyncKeyState(VK_RMENU)
+    return result & 0x8000 != 0
 
 
 # ========== 小龙虾绘制 ==========
@@ -145,21 +166,21 @@ def setup_window(hwnd):
 # ========== Pygame 状态窗口 ==========
 
 def pygame_window_thread():
-    """pygame 窗口线程"""
+    """pygame 窗口线程 - 仅在主显示器显示"""
     import pygame
     import pygame.freetype
 
     pygame.init()
     pygame.display.set_caption("Voice Typer")
 
-    # 获取主显示器尺寸 (使用 Windows API)
-    SM_CXSCREEN = 0
-    SM_CYSCREEN = 1
+    # 获取主显示器尺寸 (使用 Windows API，仅主显示器)
+    SM_CXSCREEN = 0  # 主显示器宽度
+    SM_CYSCREEN = 1  # 主显示器高度
     screen_width = windll.user32.GetSystemMetrics(SM_CXSCREEN)
     x = (screen_width - WINDOW_WIDTH) // 2
     y = 80
 
-    # 创建窗口
+    # 创建窗口 - 指定在主显示器上
     window = pygame.display.set_mode(
         (WINDOW_WIDTH, WINDOW_HEIGHT),
         pygame.NOFRAME
@@ -167,13 +188,15 @@ def pygame_window_thread():
 
     # 获取窗口句柄并设置样式
     state.hwnd = pygame.display.get_wm_info()['window']
+    state.hwnd_set = True
 
-    # 设置窗口位置和置顶
+    # 设置窗口位置和置顶 (确保在主显示器)
     HWND_TOPMOST = -1
     SWP_NOSIZE = 0x0001
     SWP_NOMOVE = 0x0002
     SWP_SHOWWINDOW = 0x0040
 
+    # 立即设置位置，确保在主显示器
     windll.user32.SetWindowPos(
         state.hwnd,
         HWND_TOPMOST,
@@ -226,12 +249,29 @@ def pygame_window_thread():
 
 
 def show_status(message, color=(50, 50, 50)):
-    """显示状态"""
+    """显示状态 - 确保只在主显示器显示"""
     state.status_text = message
     state.status_color = color
     state.window_visible = True
     if state.hwnd:
-        windll.user32.ShowWindow(state.hwnd, 5)
+        # 每次显示时重新定位到主显示器中心
+        SM_CXSCREEN = 0
+        screen_width = windll.user32.GetSystemMetrics(SM_CXSCREEN)
+        x = (screen_width - WINDOW_WIDTH) // 2
+        y = 80
+
+        HWND_TOPMOST = -1
+        SWP_NOSIZE = 0x0001
+        SWP_NOZORDER = 0x0004
+        SWP_SHOWWINDOW = 0x0040
+
+        windll.user32.SetWindowPos(
+            state.hwnd,
+            HWND_TOPMOST,
+            x, y, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW
+        )
+        windll.user32.ShowWindow(state.hwnd, 5)  # SW_SHOW
 
 
 def hide_status():
@@ -423,7 +463,7 @@ def process_audio(audio_path):
 
 def main():
     print("=" * 50)
-    print("Voice Typer v3.2 (玻璃透明版)")
+    print("Voice Typer v3.3 (玻璃透明版)")
     print("=" * 50)
     print()
     print("快捷键: 按住 左Alt 说话，松开识别")
@@ -438,33 +478,36 @@ def main():
     time.sleep(0.5)
 
     print("[OK] 玻璃窗口已启动")
-    print("[OK] 快捷键监听已启动 (左Alt)")
+    print("[OK] 快捷键监听已启动 (Windows API 精确检测左Alt)")
 
     import keyboard
 
-    # 只监听左 Alt (扫描码 56)，排除右 Alt
-    LEFT_ALT_SCANCODE = 56
-
+    # 主循环 - 使用 Windows API 检测左 Alt
     while state.running:
         try:
-            # 使用扫描码精确检测左 Alt
-            current_state = keyboard.is_pressed(56)  # 左 Alt 扫描码
-
-            if current_state and not state.last_key_state:
-                start_recording()
-            elif not current_state and state.last_key_state:
-                audio_path = stop_recording()
-                if audio_path:
-                    threading.Thread(target=process_audio, args=(audio_path,), daemon=True).start()
-
-            state.last_key_state = current_state
-
+            # 检测 ESC 退出
             if keyboard.is_pressed('esc'):
                 print("\n[EXIT] 退出...")
                 state.running = False
                 os._exit(0)
 
-            time.sleep(0.02)
+            # 精确检测左 Alt (排除右 Alt)
+            left_alt = is_left_alt_pressed()
+            right_alt = is_right_alt_pressed()
+
+            # 只响应左 Alt 按下，且右 Alt 未按下
+            if left_alt and not right_alt:
+                if not state.last_key_state:
+                    state.last_key_state = True
+                    start_recording()
+            else:
+                if state.last_key_state:
+                    state.last_key_state = False
+                    audio_path = stop_recording()
+                    if audio_path:
+                        threading.Thread(target=process_audio, args=(audio_path,), daemon=True).start()
+
+            time.sleep(0.02)  # 50Hz 检测频率
 
         except Exception as e:
             print(f"[ERR] {e}")
