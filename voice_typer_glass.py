@@ -152,9 +152,10 @@ def pygame_window_thread():
     pygame.init()
     pygame.display.set_caption("Voice Typer")
 
-    # 获取屏幕尺寸
-    info = pygame.display.Info()
-    screen_width = info.current_w
+    # 获取主显示器尺寸 (使用 Windows API)
+    SM_CXSCREEN = 0
+    SM_CYSCREEN = 1
+    screen_width = windll.user32.GetSystemMetrics(SM_CXSCREEN)
     x = (screen_width - WINDOW_WIDTH) // 2
     y = 80
 
