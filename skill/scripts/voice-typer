@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Voice Typer CLI 入口
+"""
+
+import argparse
+import subprocess
+import sys
+import os
+from pathlib import Path
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Voice Typer - 轻量级语音输入工具"
+    )
+
+    parser.add_argument(
+        "--shortcut", "-s",
+        default="left alt",
+        help="录音快捷键 (默认: left alt)"
+    )
+
+    parser.add_argument(
+        "--font", "-f",
+        default="KaiTi",
+        help="显示字体 (默认: KaiTi)"
+    )
+
+    parser.add_argument(
+        "--style",
+        choices=["glass", "simple"],
+        default="glass",
+        help="窗口风格 (默认: glass)"
+    )
+
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="后台静默运行"
+    )
+
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="安装依赖"
+    )
+
+    args = parser.parse_args()
+
+    # 安装模式
+    if args.install:
+        script_dir = Path(__file__).parent
+        install_script = script_dir / "install.py"
+        subprocess.run([sys.executable, str(install_script)])
+        return
+
+    # 获取主程序路径
+    script_dir = Path(__file__).parent
+    main_script = script_dir / "voice_typer.py"
+
+    if not main_script.exists():
+        print(f"❌ 找不到主程序: {main_script}")
+        sys.exit(1)
+
+    # 构建命令
+    cmd = [sys.executable, str(main_script)]
+
+    # 静默模式
+    if args.silent:
+        if sys.platform == "win32":
+            # Windows: 使用 pythonw
+            cmd[0] = sys.executable.replace("python.exe", "pythonw.exe")
+        else:
+            # Unix: 使用 nohup
+            cmd = ["nohup"] + cmd + ["&"]
+
+    # 启动程序
+    print("🎤 Voice Typer 启动中...")
+    print(f"   快捷键: {args.shortcut}")
+    print(f"   字体: {args.font}")
+    print(f"   风格: {args.style}")
+    print()
+    print("按住快捷键说话，松开自动打字")
+    print("按 ESC 退出")
+    print()
+
+    subprocess.run(cmd)
+
+if __name__ == "__main__":
+    main()
