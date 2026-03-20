@@ -45,6 +45,79 @@ class State:
 state = State()
 
 
+# ========== 小龙虾绘制 ==========
+def draw_crayfish(surface, x, y, scale=1.0):
+    """绘制一只可爱的小龙虾"""
+    import pygame
+
+    # 颜色
+    red = (220, 80, 60)
+    dark_red = (180, 50, 40)
+    orange = (255, 140, 0)
+    white = (255, 255, 255)
+    black = (30, 30, 30)
+
+    s = scale
+    px = int(x * s) if scale != 1.0 else x
+
+    # 身体 (椭圆形)
+    body_rect = pygame.Rect(px - 12, y - 6, 24, 12)
+    pygame.draw.ellipse(surface, red, body_rect)
+    pygame.draw.ellipse(surface, dark_red, body_rect, 1)
+
+    # 头部
+    head_rect = pygame.Rect(px - 18, y - 5, 12, 10)
+    pygame.draw.ellipse(surface, red, head_rect)
+
+    # 眼睛 (在触角柄上)
+    pygame.draw.circle(surface, white, (px - 14, y - 10), 3)
+    pygame.draw.circle(surface, black, (px - 14, y - 10), 1.5)
+    pygame.draw.circle(surface, white, (px - 8, y - 10), 3)
+    pygame.draw.circle(surface, black, (px - 8, y - 10), 1.5)
+
+    # 触角
+    pygame.draw.line(surface, dark_red, (px - 16, y - 8), (px - 20, y - 15), 1)
+    pygame.draw.line(surface, dark_red, (px - 10, y - 8), (px - 8, y - 15), 1)
+
+    # 大钳子 (左边)
+    claw_points_left = [
+        (px - 22, y + 2),
+        (px - 28, y - 2),
+        (px - 30, y - 6),
+        (px - 26, y - 4),
+        (px - 22, y - 2)
+    ]
+    pygame.draw.polygon(surface, red, claw_points_left)
+    pygame.draw.polygon(surface, dark_red, claw_points_left, 1)
+
+    # 大钳子 (右边)
+    claw_points_right = [
+        (px + 10, y + 2),
+        (px + 16, y - 2),
+        (px + 18, y - 6),
+        (px + 14, y - 4),
+        (px + 10, y - 2)
+    ]
+    pygame.draw.polygon(surface, red, claw_points_right)
+    pygame.draw.polygon(surface, dark_red, claw_points_right, 1)
+
+    # 尾巴扇形
+    tail_points = [
+        (px + 10, y),
+        (px + 18, y - 4),
+        (px + 22, y),
+        (px + 18, y + 4)
+    ]
+    pygame.draw.polygon(surface, orange, tail_points)
+    pygame.draw.polygon(surface, dark_red, tail_points, 1)
+
+    # 腿 (简化)
+    for i in range(3):
+        leg_x = px - 6 + i * 6
+        pygame.draw.line(surface, dark_red, (leg_x, y + 4), (leg_x - 2, y + 8), 1)
+        pygame.draw.line(surface, dark_red, (leg_x, y + 4), (leg_x + 2, y + 8), 1)
+
+
 # ========== Windows API 设置圆角和透明 ==========
 def setup_window(hwnd):
     """设置窗口圆角和透明效果"""
@@ -132,8 +205,11 @@ def pygame_window_thread():
                 return
 
         if state.window_visible and state.status_text:
-            # 绘制
+            # 绘制背景
             window.fill(bg_color[:3])  # pygame 不支持 alpha 填充
+
+            # 绘制小龙虾 (趴在右下角)
+            draw_crayfish(window, WINDOW_WIDTH - 25, WINDOW_HEIGHT - 12, 1.0)
 
             # 绘制文字 (黑色)
             text_rect = font.get_rect(state.status_text)
@@ -365,9 +441,13 @@ def main():
 
     import keyboard
 
+    # 只监听左 Alt (扫描码 56)，排除右 Alt
+    LEFT_ALT_SCANCODE = 56
+
     while state.running:
         try:
-            current_state = keyboard.is_pressed('left alt')
+            # 使用扫描码精确检测左 Alt
+            current_state = keyboard.is_pressed(56)  # 左 Alt 扫描码
 
             if current_state and not state.last_key_state:
                 start_recording()
