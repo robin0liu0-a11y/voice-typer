@@ -40,10 +40,12 @@ VK_LMENU = 0xA4  # 左 Alt
 VK_RMENU = 0xA5  # 右 Alt
 VK_V = 0x56      # V 键
 
-# 修复 Windows 控制台编码
+# 修复 Windows 控制台编码 (PyInstaller 打包后 stdout 可能是 None)
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stdout:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stderr:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # Get笔记 API 配置 (从 .env 文件或环境变量读取)
 def load_getnote_config():
