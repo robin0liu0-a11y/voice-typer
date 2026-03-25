@@ -47,6 +47,15 @@ if sys.platform == "win32":
     if sys.stderr:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# 安全的 print 函数 (PyInstaller 无控制台模式下不会崩溃)
+def safe_print(*args, **kwargs):
+    if sys.stdout:
+        print(*args, **kwargs)
+
+# 替换全局 print
+_print = print
+print = safe_print
+
 # Get笔记 API 配置 (从 .env 文件或环境变量读取)
 def load_getnote_config():
     """加载 Get笔记 API 配置"""
