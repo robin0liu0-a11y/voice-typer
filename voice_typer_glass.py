@@ -14,11 +14,23 @@ import time
 import ctypes
 import tempfile
 import json
+import logging
 import urllib.request
 import urllib.error
 from pathlib import Path
 from datetime import datetime
 from ctypes import windll, c_int, byref, sizeof, c_ulong, c_short
+
+# ========== 日志配置 ==========
+LOG_FILE = Path(tempfile.gettempdir()) / "voice_typer.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+    ]
+)
+log = logging.getLogger(__name__)
 
 # ========== 单实例检查 ==========
 def check_single_instance():
@@ -29,7 +41,7 @@ def check_single_instance():
         lock_socket.bind(('127.0.0.1', 51234))
         return lock_socket
     except:
-        print("[ERR] 已有 Voice Typer 在运行")
+        log.error("已有 Voice Typer 在运行")
         sys.exit(1)
 
 # 单实例锁
@@ -39,22 +51,6 @@ _instance_lock = check_single_instance()
 VK_LMENU = 0xA4  # 左 Alt
 VK_RMENU = 0xA5  # 右 Alt
 VK_V = 0x56      # V 键
-
-# 修复 Windows 控制台编码 (PyInstaller 打包后 stdout 可能是 None)
-if sys.platform == "win32":
-    if sys.stdout:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if sys.stderr:
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-# 安全的 print 函数 (PyInstaller 无控制台模式下不会崩溃)
-def safe_print(*args, **kwargs):
-    if sys.stdout:
-        print(*args, **kwargs)
-
-# 替换全局 print
-_print = print
-print = safe_print
 
 # Get笔记 API 配置 (从 .env 文件或环境变量读取)
 def load_getnote_config():
@@ -369,7 +365,7 @@ def start_recording():
 
         def callback(indata, frames, time_info, status):
             if status:
-                print(f"[WARN] {status}")
+                log.warning(str(status))
             state.audio_data.append(indata.copy())
 
         state.stream = sd.InputStream(
@@ -383,7 +379,7 @@ def start_recording():
         play_beep(800, 80)
         play_beep(1000, 80)
         show_status("🎤 正在收听...", (80, 80, 80))
-        print("\n[REC] 正在收听...")
+        log.info("正在收听...")
 
         def update_timer():
             while state.is_recording:
@@ -394,7 +390,7 @@ def start_recording():
         threading.Thread(target=update_timer, daemon=True).start()
 
     except Exception as e:
-        print(f"[ERR] 录音失败: {e}")
+        log.error(f"录音失败: {e}")
         state.is_recording = False
         hide_status()
 
@@ -412,7 +408,7 @@ def stop_recording():
             state.stream = None
 
         if not state.audio_data:
-            print("[WARN] 无音频数据")
+            log.warning("无音频数据")
             hide_status()
             return None
 
@@ -423,7 +419,7 @@ def stop_recording():
         duration = len(audio) / SAMPLE_RATE
 
         if duration < 0.3:
-            print(f"[WARN] 录音太短: {duration:.1f}s")
+            log.warning(f"录音太短: {duration:.1f}s")
             play_beep(400, 200)
             show_status("❌ 太短", (200, 50, 50))
             time.sleep(1)
@@ -435,12 +431,12 @@ def stop_recording():
         play_beep(1000, 80)
         play_beep(600, 120)
         show_status("🔄 识别中...", (100, 100, 100))
-        print(f"[OK] 录音完成: {duration:.1f}s")
+        log.info(f"录音完成: {duration:.1f}s")
 
         return str(TEMP_AUDIO)
 
     except Exception as e:
-        print(f"[ERR] 停止录音失败: {e}")
+        log.error(f"停止录音失败: {e}")
         hide_status()
         return None
 
@@ -457,7 +453,7 @@ def recognize(audio_path):
         )
 
         if result.returncode != 0:
-            print(f"[ERR] 识别失败: {result.stderr}")
+            log.error(f"识别失败: {result.stderr}")
             return ""
 
         output = result.stdout.strip()
@@ -468,7 +464,7 @@ def recognize(audio_path):
         return output
 
     except Exception as e:
-        print(f"[ERR] 识别错误: {e}")
+        log.error(f"识别错误: {e}")
         return ""
 
 
@@ -491,11 +487,11 @@ def type_text(text):
         import keyboard
         time.sleep(0.2)
         keyboard.write(text, delay=0.02)
-        print(f"[OK] 已输入: {text}")
+        log.info(f"已输入: {text}")
         play_beep(1000, 50)
         play_beep(1200, 80)
     except Exception as e:
-        print(f"[ERR] 输入失败: {e}")
+        log.error(f"输入失败: {e}")
 
 
 def process_audio(audio_path):
@@ -531,7 +527,7 @@ VOICE_NOTE_TOPIC_ID = "EJXjKbqY"  # "语音笔记" 知识库
 def save_to_getnote(text):
     """保存文字到 Get笔记"""
     if not GETNOTE_API_KEY or not GETNOTE_CLIENT_ID:
-        print("[WARN] Get笔记 API 未配置")
+        log.warning("Get笔记 API 未配置")
         return False, "API未配置"
 
     try:
@@ -569,14 +565,14 @@ def save_to_getnote(text):
             result = json.loads(raw_data)
 
             if result.get("success"):
-                print(f"[OK] 已保存到 Get笔记: {title}")
+                log.info(f"已保存到 Get笔记: {title}")
 
                 # 获取 note_id (64位整数，用正则提取避免精度丢失)
                 # API 返回的字段可能是 "id" 或 "note_id"
                 note_id_match = re.search(r'"(?:note_)?id"\s*:\s*(\d+)', raw_data)
                 note_id = int(note_id_match.group(1)) if note_id_match else None
 
-                print(f"[DEBUG] note_id: {note_id}")
+                log.debug(f"note_id: {note_id}")
 
                 # 添加到知识库
                 if note_id and VOICE_NOTE_TOPIC_ID:
@@ -585,11 +581,11 @@ def save_to_getnote(text):
                 return True, title
             else:
                 error = result.get("error", {})
-                print(f"[ERR] Get笔记保存失败: {error.get('message', 'unknown')}")
+                log.error(f"Get笔记保存失败: {error.get('message', 'unknown')}")
                 return False, error.get("message", "保存失败")
 
     except Exception as e:
-        print(f"[ERR] Get笔记 API 错误: {e}")
+        log.error(f"Get笔记 API 错误: {e}")
         return False, str(e)
 
 
@@ -615,12 +611,12 @@ def add_note_to_topic(note_id, topic_id):
         with urllib.request.urlopen(req, timeout=10) as response:
             result = json.loads(response.read().decode("utf-8"))
             if result.get("success"):
-                print(f"[OK] 已添加到知识库")
+                log.info("已添加到知识库")
             else:
-                print(f"[WARN] 添加到知识库失败: {result.get('error', {}).get('message', '')}")
+                log.warning(f"添加到知识库失败: {result.get('error', {}).get('message', '')}")
 
     except Exception as e:
-        print(f"[WARN] 添加到知识库异常: {e}")
+        log.warning(f"添加到知识库异常: {e}")
 
 
 def process_audio_for_note(audio_path):
@@ -661,22 +657,17 @@ def process_audio_for_note(audio_path):
 
 
 def main():
-    print("=" * 50)
-    print("Voice Typer v3.5 (玻璃透明版 + Get笔记 + 单实例)")
-    print("=" * 50)
-    print()
-    print("快捷键:")
-    print("  左 Alt    → 语音打字")
-    print("  Alt + V   → 语音存笔记 (Get笔记)")
-    print("  ESC       → 退出")
-    print()
+    log.info("=" * 50)
+    log.info("Voice Typer v3.5 (玻璃透明版 + Get笔记 + 单实例)")
+    log.info("=" * 50)
+    log.info("快捷键: 左Alt=打字, Alt+V=笔记, ESC=退出")
+    log.info(f"日志文件: {LOG_FILE}")
 
     # 检查 Get笔记配置
     if GETNOTE_API_KEY:
-        print(f"[OK] Get笔记 API 已配置")
+        log.info("Get笔记 API 已配置")
     else:
-        print("[WARN] Get笔记 API 未配置 (设置 GETNOTE_API_KEY 环境变量)")
-    print()
+        log.warning("Get笔记 API 未配置")
 
     # 启动 pygame 窗口线程
     pygame_thread = threading.Thread(target=pygame_window_thread, daemon=True)
@@ -685,8 +676,8 @@ def main():
     # 等待 pygame 初始化
     time.sleep(0.5)
 
-    print("[OK] 玻璃窗口已启动")
-    print("[OK] 快捷键监听已启动")
+    log.info("玻璃窗口已启动")
+    log.info("快捷键监听已启动")
 
     import keyboard
 
@@ -695,7 +686,7 @@ def main():
         try:
             # 检测 ESC 退出
             if keyboard.is_pressed('esc'):
-                print("\n[EXIT] 退出...")
+                log.info("退出...")
                 state.running = False
                 os._exit(0)
 
@@ -732,7 +723,7 @@ def main():
             time.sleep(0.02)  # 50Hz 检测频率
 
         except Exception as e:
-            print(f"[ERR] {e}")
+            log.error(str(e))
             time.sleep(0.1)
 
 
