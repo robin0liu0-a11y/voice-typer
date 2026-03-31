@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Voice Typer v3.5 - 玻璃透明版 + Get笔记
-按住左 Alt 说话，松开自动打字
-按住 Alt + V 说话，松开保存到 Get笔记
+Voice Typer v3.6 - 玻璃透明版 + Get笔记 + 系统托盘
+按住 Alt+C 说话，松开自动打字
+按住 Alt+V 说话，松开保存到 Get笔记
+右键托盘图标退出
 """
 
 import os
 import sys
 import subprocess
+import shutil
 import threading
 import time
 import ctypes
@@ -18,8 +20,7 @@ import logging
 import urllib.request
 import urllib.error
 from pathlib import Path
-from datetime import datetime
-from ctypes import windll, c_int, byref, sizeof, c_ulong, c_short
+from ctypes import windll, c_int, byref, sizeof
 
 # ========== 日志配置 ==========
 LOG_FILE = Path(tempfile.gettempdir()) / "voice_typer.log"
@@ -40,7 +41,7 @@ def check_single_instance():
     try:
         lock_socket.bind(('127.0.0.1', 51234))
         return lock_socket
-    except:
+    except OSError:
         log.error("已有 Voice Typer 在运行")
         sys.exit(1)
 
@@ -51,22 +52,22 @@ _instance_lock = check_single_instance()
 VK_LMENU = 0xA4  # 左 Alt
 VK_RMENU = 0xA5  # 右 Alt
 VK_V = 0x56      # V 键
+VK_C = 0x43      # C 键
 
 # Get笔记 API 配置 (从 .env 文件或环境变量读取)
 def load_getnote_config():
     """加载 Get笔记 API 配置"""
-    # 尝试从 .env 文件加载
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").strip().split("\n"):
-            if "=" in line and not line.startswith("#"):
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-                if key == "GETNOTE_API_KEY":
-                    os.environ[key] = value
-                elif key == "GETNOTE_CLIENT_ID":
-                    os.environ[key] = value
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key in ("GETNOTE_API_KEY", "GETNOTE_CLIENT_ID"):
+                os.environ[key] = value
 
     return (
         os.environ.get("GETNOTE_API_KEY", ""),
@@ -79,17 +80,18 @@ GETNOTE_API_URL = "https://openapi.biji.com"
 # 配置
 SAMPLE_RATE = 16000
 CHANNELS = 1
-TEMP_AUDIO = Path(tempfile.gettempdir()) / "voice_typer.wav"
 WINDOW_WIDTH = 300
 WINDOW_HEIGHT = 50
 
 # 状态
+_state_lock = threading.Lock()
+
 class State:
     is_recording = False
     audio_data = []
     stream = None
-    last_key_state = False  # 左 Alt
-    last_alt_v_state = False  # Alt + V
+    last_key_state = False
+    last_alt_v_state = False
     record_start_time = None
     running = True
     status_text = ""
@@ -98,7 +100,7 @@ class State:
     hwnd = None
     processing = False
     hwnd_set = False
-    note_mode = False  # 是否为笔记模式
+    note_mode = False
 
 state = State()
 
@@ -122,6 +124,15 @@ def is_v_pressed():
 def is_alt_v_pressed():
     """检测 Alt + V 组合键"""
     return is_left_alt_pressed() and not is_right_alt_pressed() and is_v_pressed()
+
+def is_c_pressed():
+    """检测 C 键状态"""
+    result = windll.user32.GetAsyncKeyState(VK_C)
+    return result & 0x8000 != 0
+
+def is_alt_c_pressed():
+    """检测 Alt + C 组合键"""
+    return is_left_alt_pressed() and not is_right_alt_pressed() and is_c_pressed()
 
 
 # ========== 小龙虾绘制 ==========
@@ -225,85 +236,88 @@ def setup_window(hwnd):
 
 def pygame_window_thread():
     """pygame 窗口线程 - 仅在主显示器显示"""
-    import pygame
-    import pygame.freetype
-
-    pygame.init()
-    pygame.display.set_caption("Voice Typer")
-
-    # 获取主显示器尺寸 (使用 Windows API，仅主显示器)
-    SM_CXSCREEN = 0  # 主显示器宽度
-    SM_CYSCREEN = 1  # 主显示器高度
-    screen_width = windll.user32.GetSystemMetrics(SM_CXSCREEN)
-    x = (screen_width - WINDOW_WIDTH) // 2
-    y = 80
-
-    # 创建窗口 - 指定在主显示器上
-    window = pygame.display.set_mode(
-        (WINDOW_WIDTH, WINDOW_HEIGHT),
-        pygame.NOFRAME
-    )
-
-    # 获取窗口句柄并设置样式
-    state.hwnd = pygame.display.get_wm_info()['window']
-    state.hwnd_set = True
-
-    # 设置窗口位置和置顶 (确保在主显示器)
-    HWND_TOPMOST = -1
-    SWP_NOSIZE = 0x0001
-    SWP_NOMOVE = 0x0002
-    SWP_SHOWWINDOW = 0x0040
-
-    # 立即设置位置，确保在主显示器
-    windll.user32.SetWindowPos(
-        state.hwnd,
-        HWND_TOPMOST,
-        x, y, WINDOW_WIDTH, WINDOW_HEIGHT,
-        SWP_SHOWWINDOW
-    )
-
-    # 设置圆角和透明
-    setup_window(state.hwnd)
-
-    # 初始隐藏
-    windll.user32.ShowWindow(state.hwnd, 0)
-
-    # 字体 - 楷体
     try:
-        font = pygame.freetype.SysFont("KaiTi", 18)
-    except:
+        import pygame
+        import pygame.freetype
+
+        pygame.init()
+        pygame.display.set_caption("Voice Typer")
+
+        # 获取主显示器尺寸 (使用 Windows API，仅主显示器)
+        SM_CXSCREEN = 0  # 主显示器宽度
+        SM_CYSCREEN = 1  # 主显示器高度
+        screen_width = windll.user32.GetSystemMetrics(SM_CXSCREEN)
+        x = (screen_width - WINDOW_WIDTH) // 2
+        y = 80
+
+        # 创建窗口 - 指定在主显示器上
+        window = pygame.display.set_mode(
+            (WINDOW_WIDTH, WINDOW_HEIGHT),
+            pygame.NOFRAME
+        )
+
+        # 获取窗口句柄并设置样式
+        state.hwnd = pygame.display.get_wm_info()['window']
+        state.hwnd_set = True
+
+        # 设置窗口位置和置顶 (确保在主显示器)
+        HWND_TOPMOST = -1
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_SHOWWINDOW = 0x0040
+
+        # 立即设置位置，确保在主显示器
+        windll.user32.SetWindowPos(
+            state.hwnd,
+            HWND_TOPMOST,
+            x, y, WINDOW_WIDTH, WINDOW_HEIGHT,
+            SWP_SHOWWINDOW
+        )
+
+        # 设置圆角和透明
+        setup_window(state.hwnd)
+
+        # 初始隐藏
+        windll.user32.ShowWindow(state.hwnd, 0)
+
+        # 字体 - 楷体
         try:
-            font = pygame.freetype.SysFont("楷体", 18)
-        except:
-            font = pygame.freetype.SysFont("Microsoft YaHei UI", 16)
+            font = pygame.freetype.SysFont("KaiTi", 18)
+        except Exception:
+            try:
+                font = pygame.freetype.SysFont("楷体", 18)
+            except Exception:
+                font = pygame.freetype.SysFont("Microsoft YaHei UI", 16)
 
-    clock = pygame.time.Clock()
-    bg_color = (255, 255, 255, 200)  # 白色半透明背景
+        clock = pygame.time.Clock()
+        bg_color = (255, 255, 255, 200)  # 白色半透明背景
 
-    while state.running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                state.running = False
-                return
+        while state.running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return  # 不设置 running=False，让主循环决定
 
-        if state.window_visible and state.status_text:
-            # 绘制背景
-            window.fill(bg_color[:3])  # pygame 不支持 alpha 填充
+            if state.window_visible and state.status_text:
+                # 绘制背景
+                window.fill(bg_color[:3])  # pygame 不支持 alpha 填充
 
-            # 绘制小龙虾 (趴在右下角)
-            draw_crayfish(window, WINDOW_WIDTH - 25, WINDOW_HEIGHT - 12, 1.0)
+                # 绘制小龙虾 (趴在右下角)
+                draw_crayfish(window, WINDOW_WIDTH - 25, WINDOW_HEIGHT - 12, 1.0)
 
-            # 绘制文字 (黑色)
-            text_rect = font.get_rect(state.status_text)
-            text_x = (WINDOW_WIDTH - text_rect.width) // 2
-            text_y = (WINDOW_HEIGHT - text_rect.height) // 2
-            font.render_to(window, (text_x, text_y), state.status_text, state.status_color)
+                # 绘制文字 (黑色)
+                text_rect = font.get_rect(state.status_text)
+                text_x = (WINDOW_WIDTH - text_rect.width) // 2
+                text_y = (WINDOW_HEIGHT - text_rect.height) // 2
+                font.render_to(window, (text_x, text_y), state.status_text, state.status_color)
 
-            pygame.display.flip()
+                pygame.display.flip()
 
-        clock.tick(30)
+            clock.tick(30)
 
-    pygame.quit()
+        pygame.quit()
+    except Exception as e:
+        log.error(f"pygame 线程异常: {e}", exc_info=True)
+        state.hwnd = None
 
 
 def show_status(message, color=(50, 50, 50)):
@@ -346,27 +360,30 @@ def play_beep(freq, duration):
     try:
         import winsound
         winsound.Beep(freq, duration)
-    except:
+    except Exception:
         pass
 
 
 # ========== 录音模块 ==========
 
 def start_recording():
-    if state.is_recording or state.processing:
-        return
+    with _state_lock:
+        if state.is_recording or state.processing:
+            return
 
     try:
         import sounddevice as sd
 
-        state.is_recording = True
-        state.audio_data = []
-        state.record_start_time = time.time()
+        with _state_lock:
+            state.is_recording = True
+            state.audio_data = []
+            state.record_start_time = time.time()
 
-        def callback(indata, frames, time_info, status):
-            if status:
-                log.warning(str(status))
-            state.audio_data.append(indata.copy())
+        def callback(indata, frames, time_info, cb_status):
+            if cb_status:
+                log.warning(str(cb_status))
+            with _state_lock:
+                state.audio_data.append(indata.copy())
 
         state.stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -390,16 +407,16 @@ def start_recording():
         threading.Thread(target=update_timer, daemon=True).start()
 
     except Exception as e:
-        log.error(f"录音失败: {e}")
+        log.error(f"录音失败: {e}", exc_info=True)
         state.is_recording = False
         hide_status()
 
 
 def stop_recording():
-    if not state.is_recording:
-        return None
-
-    state.is_recording = False
+    with _state_lock:
+        if not state.is_recording:
+            return None
+        state.is_recording = False
 
     try:
         if state.stream:
@@ -426,30 +443,45 @@ def stop_recording():
             hide_status()
             return None
 
-        sf.write(str(TEMP_AUDIO), audio, SAMPLE_RATE)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        sf.write(tmp.name, audio, SAMPLE_RATE)
 
         play_beep(1000, 80)
         play_beep(600, 120)
         show_status("🔄 识别中...", (100, 100, 100))
         log.info(f"录音完成: {duration:.1f}s")
 
-        return str(TEMP_AUDIO)
+        return tmp.name
 
     except Exception as e:
-        log.error(f"停止录音失败: {e}")
+        log.error(f"停止录音失败: {e}", exc_info=True)
         hide_status()
         return None
+
+
+def find_coli():
+    """查找 coli 可执行文件路径"""
+    # 优先从 PATH 查找
+    coli_path = shutil.which("coli")
+    if coli_path:
+        return coli_path
+    # 常见路径 fallback
+    npm_coli = Path(os.environ.get("APPDATA", "")) / "npm" / "coli.cmd"
+    if npm_coli.exists():
+        return str(npm_coli)
+    return "coli"
 
 
 def recognize(audio_path):
     try:
         result = subprocess.run(
-            f'coli asr "{audio_path}"',
-            shell=True,
+            f'"{find_coli()}" asr "{audio_path}"',
             capture_output=True,
             text=True,
-            timeout=60,
-            encoding="utf-8"
+            timeout=30,
+            encoding="utf-8",
+            shell=True
         )
 
         if result.returncode != 0:
@@ -464,7 +496,7 @@ def recognize(audio_path):
         return output
 
     except Exception as e:
-        log.error(f"识别错误: {e}")
+        log.error(f"识别错误: {e}", exc_info=True)
         return ""
 
 
@@ -481,25 +513,40 @@ def add_punctuation(text):
 
 
 def type_text(text):
+    """通过剪贴板粘贴输入文字"""
     if not text:
         return
     try:
-        import keyboard
-        time.sleep(0.2)
-        keyboard.write(text, delay=0.02)
-        log.info(f"已输入: {text}")
+        import win32clipboard
+        import win32con
+
+        # 写入剪贴板
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+        win32clipboard.CloseClipboard()
+
+        # 模拟 Ctrl+V 粘贴
+        time.sleep(0.15)
+        KEYEVENTF_KEYUP = 0x0002
+        windll.user32.keybd_event(0x11, 0, 0, 0)  # VK_CONTROL
+        windll.user32.keybd_event(0x56, 0, 0, 0)  # VK_V
+        windll.user32.keybd_event(0x56, 0, KEYEVENTF_KEYUP, 0)
+        windll.user32.keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0)
+
+        log.info(f"已输入: ({len(text)}字)")
         play_beep(1000, 50)
         play_beep(1200, 80)
     except Exception as e:
-        log.error(f"输入失败: {e}")
+        log.error(f"输入失败: {e}", exc_info=True)
 
 
 def process_audio(audio_path):
     """普通模式：识别后打字"""
-    if state.processing:
-        return
-
-    state.processing = True
+    with _state_lock:
+        if state.processing:
+            return
+        state.processing = True
     try:
         text = recognize(audio_path)
         if text:
@@ -518,6 +565,10 @@ def process_audio(audio_path):
             hide_status()
     finally:
         state.processing = False
+        try:
+            Path(audio_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ========== Get笔记 API ==========
@@ -621,10 +672,10 @@ def add_note_to_topic(note_id, topic_id):
 
 def process_audio_for_note(audio_path):
     """笔记模式：识别后保存到 Get笔记"""
-    if state.processing:
-        return
-
-    state.processing = True
+    with _state_lock:
+        if state.processing:
+            return
+        state.processing = True
     try:
         text = recognize(audio_path)
         if text:
@@ -654,13 +705,57 @@ def process_audio_for_note(audio_path):
     finally:
         state.processing = False
         state.note_mode = False
+        try:
+            Path(audio_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ========== 系统托盘 ==========
+
+def create_tray_icon():
+    """加载项目图标作为托盘图标"""
+    from PIL import Image
+    icon_path = Path(__file__).parent / "assets" / "icon.png"
+    if icon_path.exists():
+        image = Image.open(icon_path)
+        return image.resize((64, 64), Image.LANCZOS)
+    # fallback: 红色圆点
+    from PIL import ImageDraw
+    image = Image.new('RGB', (64, 64), (255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse([8, 8, 56, 56], fill=(220, 80, 60))
+    return image
+
+def on_tray_quit(icon, item):
+    """托盘退出"""
+    state.running = False
+    icon.stop()
+
+def tray_thread():
+    """系统托盘线程"""
+    try:
+        import pystray
+        icon = pystray.Icon(
+            "Voice Typer",
+            create_tray_icon(),
+            "Voice Typer v3.6",
+            menu=pystray.Menu(
+                pystray.MenuItem("Voice Typer v3.6", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出", on_tray_quit),
+            )
+        )
+        icon.run()
+    except Exception as e:
+        log.error(f"托盘线程异常: {e}", exc_info=True)
 
 
 def main():
     log.info("=" * 50)
-    log.info("Voice Typer v3.5 (玻璃透明版 + Get笔记 + 单实例)")
+    log.info("Voice Typer v3.6 (玻璃透明版 + Get笔记 + 系统托盘)")
     log.info("=" * 50)
-    log.info("快捷键: 左Alt=打字, Alt+V=笔记, ESC=退出")
+    log.info("快捷键: Alt+C=打字, Alt+V=笔记, 托盘退出")
     log.info(f"日志文件: {LOG_FILE}")
 
     # 检查 Get笔记配置
@@ -669,34 +764,26 @@ def main():
     else:
         log.warning("Get笔记 API 未配置")
 
+    # 启动系统托盘
+    threading.Thread(target=tray_thread, daemon=True).start()
+    log.info("系统托盘已启动")
+
     # 启动 pygame 窗口线程
-    pygame_thread = threading.Thread(target=pygame_window_thread, daemon=True)
-    pygame_thread.start()
+    threading.Thread(target=pygame_window_thread, daemon=True).start()
 
     # 等待 pygame 初始化
     time.sleep(0.5)
 
-    log.info("玻璃窗口已启动")
     log.info("快捷键监听已启动")
-
-    import keyboard
 
     # 主循环
     while state.running:
         try:
-            # 检测 ESC 退出
-            if keyboard.is_pressed('esc'):
-                log.info("退出...")
-                state.running = False
-                os._exit(0)
-
             # 检测 Alt + V (笔记模式) - 优先检测
             alt_v = is_alt_v_pressed()
-            left_alt = is_left_alt_pressed()
-            right_alt = is_right_alt_pressed()
+            alt_c = is_alt_c_pressed()
 
             if alt_v:
-                # Alt + V 笔记模式
                 if not state.last_alt_v_state:
                     state.last_alt_v_state = True
                     state.note_mode = True
@@ -707,8 +794,8 @@ def main():
                     audio_path = stop_recording()
                     if audio_path:
                         threading.Thread(target=process_audio_for_note, args=(audio_path,), daemon=True).start()
-                # 单独左 Alt (打字模式) - 排除 Alt+V
-                elif left_alt and not right_alt and not is_v_pressed():
+                # Alt + C (打字模式)
+                elif alt_c:
                     if not state.last_key_state:
                         state.last_key_state = True
                         state.note_mode = False
@@ -723,8 +810,15 @@ def main():
             time.sleep(0.02)  # 50Hz 检测频率
 
         except Exception as e:
-            log.error(str(e))
-            time.sleep(0.1)
+            log.error(f"主循环异常: {e}", exc_info=True)
+            time.sleep(0.5)
+
+    # 优雅退出：关闭单实例锁
+    global _instance_lock
+    if _instance_lock:
+        _instance_lock.close()
+    log.info("Voice Typer 已退出")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
