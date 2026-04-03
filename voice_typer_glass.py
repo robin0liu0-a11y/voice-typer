@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Voice Typer v3.6 - 玻璃透明版 + Get笔记 + 系统托盘
+Voice Typer v3.7 - LLM纠错 + 波形动画 + 剪贴板恢复
 按住 Alt+C 说话，松开自动打字
 按住 Alt+V 说话，松开保存到 Get笔记
-右键托盘图标退出
+右键托盘图标退出 / 切换LLM纠错
 """
 
 import os
@@ -16,6 +16,7 @@ import time
 import ctypes
 import tempfile
 import json
+import random
 import logging
 import urllib.request
 import urllib.error
@@ -54,9 +55,9 @@ VK_RMENU = 0xA5  # 右 Alt
 VK_V = 0x56      # V 键
 VK_C = 0x43      # C 键
 
-# Get笔记 API 配置 (从 .env 文件或环境变量读取)
-def load_getnote_config():
-    """加载 Get笔记 API 配置"""
+# ========== API 配置 ==========
+def load_config():
+    """加载所有配置"""
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -66,22 +67,35 @@ def load_getnote_config():
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key in ("GETNOTE_API_KEY", "GETNOTE_CLIENT_ID"):
+            if key in ("GETNOTE_API_KEY", "GETNOTE_CLIENT_ID",
+                       "LLM_API_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
                 os.environ[key] = value
 
-    return (
-        os.environ.get("GETNOTE_API_KEY", ""),
-        os.environ.get("GETNOTE_CLIENT_ID", "")
-    )
+load_config()
 
-GETNOTE_API_KEY, GETNOTE_CLIENT_ID = load_getnote_config()
+GETNOTE_API_KEY = os.environ.get("GETNOTE_API_KEY", "")
+GETNOTE_CLIENT_ID = os.environ.get("GETNOTE_CLIENT_ID", "")
 GETNOTE_API_URL = "https://openapi.biji.com"
+
+LLM_API_BASE_URL = os.environ.get("LLM_API_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "glm-4-flash")
 
 # 配置
 SAMPLE_RATE = 16000
 CHANNELS = 1
-WINDOW_WIDTH = 300
-WINDOW_HEIGHT = 50
+WINDOW_WIDTH = 400
+WINDOW_HEIGHT = 56
+
+# 波形参数
+BAR_COUNT = 5
+BAR_WIDTH = 6
+BAR_GAP = 4
+BAR_WEIGHTS = [0.5, 0.8, 1.0, 0.75, 0.55]
+BAR_MAX_HEIGHT = 32
+BAR_AREA_X = 16
+BAR_AREA_Y_CENTER = WINDOW_HEIGHT // 2
+RMS_SCALE = 500  # RMS 归一化缩放因子
 
 # 状态
 _state_lock = threading.Lock()
@@ -101,6 +115,11 @@ class State:
     processing = False
     hwnd_set = False
     note_mode = False
+    # 波形
+    current_rms = 0.0
+    rms_smooth = 0.0
+    # LLM
+    llm_enabled = False
 
 state = State()
 
@@ -135,79 +154,6 @@ def is_alt_c_pressed():
     return is_left_alt_pressed() and not is_right_alt_pressed() and is_c_pressed()
 
 
-# ========== 小龙虾绘制 ==========
-def draw_crayfish(surface, x, y, scale=1.0):
-    """绘制一只可爱的小龙虾"""
-    import pygame
-
-    # 颜色
-    red = (220, 80, 60)
-    dark_red = (180, 50, 40)
-    orange = (255, 140, 0)
-    white = (255, 255, 255)
-    black = (30, 30, 30)
-
-    s = scale
-    px = int(x * s) if scale != 1.0 else x
-
-    # 身体 (椭圆形)
-    body_rect = pygame.Rect(px - 12, y - 6, 24, 12)
-    pygame.draw.ellipse(surface, red, body_rect)
-    pygame.draw.ellipse(surface, dark_red, body_rect, 1)
-
-    # 头部
-    head_rect = pygame.Rect(px - 18, y - 5, 12, 10)
-    pygame.draw.ellipse(surface, red, head_rect)
-
-    # 眼睛 (在触角柄上)
-    pygame.draw.circle(surface, white, (px - 14, y - 10), 3)
-    pygame.draw.circle(surface, black, (px - 14, y - 10), 1.5)
-    pygame.draw.circle(surface, white, (px - 8, y - 10), 3)
-    pygame.draw.circle(surface, black, (px - 8, y - 10), 1.5)
-
-    # 触角
-    pygame.draw.line(surface, dark_red, (px - 16, y - 8), (px - 20, y - 15), 1)
-    pygame.draw.line(surface, dark_red, (px - 10, y - 8), (px - 8, y - 15), 1)
-
-    # 大钳子 (左边)
-    claw_points_left = [
-        (px - 22, y + 2),
-        (px - 28, y - 2),
-        (px - 30, y - 6),
-        (px - 26, y - 4),
-        (px - 22, y - 2)
-    ]
-    pygame.draw.polygon(surface, red, claw_points_left)
-    pygame.draw.polygon(surface, dark_red, claw_points_left, 1)
-
-    # 大钳子 (右边)
-    claw_points_right = [
-        (px + 10, y + 2),
-        (px + 16, y - 2),
-        (px + 18, y - 6),
-        (px + 14, y - 4),
-        (px + 10, y - 2)
-    ]
-    pygame.draw.polygon(surface, red, claw_points_right)
-    pygame.draw.polygon(surface, dark_red, claw_points_right, 1)
-
-    # 尾巴扇形
-    tail_points = [
-        (px + 10, y),
-        (px + 18, y - 4),
-        (px + 22, y),
-        (px + 18, y + 4)
-    ]
-    pygame.draw.polygon(surface, orange, tail_points)
-    pygame.draw.polygon(surface, dark_red, tail_points, 1)
-
-    # 腿 (简化)
-    for i in range(3):
-        leg_x = px - 6 + i * 6
-        pygame.draw.line(surface, dark_red, (leg_x, y + 4), (leg_x - 2, y + 8), 1)
-        pygame.draw.line(surface, dark_red, (leg_x, y + 4), (leg_x + 2, y + 8), 1)
-
-
 # ========== Windows API 设置圆角和透明 ==========
 def setup_window(hwnd):
     """设置窗口圆角和透明效果"""
@@ -229,86 +175,105 @@ def setup_window(hwnd):
 
     ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
     windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED)
-    windll.user32.SetLayeredWindowAttributes(hwnd, 0, 220, LWA_ALPHA)  # 220/255 透明度
+    windll.user32.SetLayeredWindowAttributes(hwnd, 0, 220, LWA_ALPHA)
 
 
 # ========== Pygame 状态窗口 ==========
-
 def pygame_window_thread():
-    """pygame 窗口线程 - 仅在主显示器显示"""
+    """pygame 窗口线程 - 波形动画 + 状态文字"""
     try:
         import pygame
         import pygame.freetype
+        import numpy as np
 
         pygame.init()
         pygame.display.set_caption("Voice Typer")
 
-        # 获取主显示器尺寸 (使用 Windows API，仅主显示器)
-        SM_CXSCREEN = 0  # 主显示器宽度
-        SM_CYSCREEN = 1  # 主显示器高度
+        # 获取主显示器尺寸
+        SM_CXSCREEN = 0
         screen_width = windll.user32.GetSystemMetrics(SM_CXSCREEN)
         x = (screen_width - WINDOW_WIDTH) // 2
         y = 80
 
-        # 创建窗口 - 指定在主显示器上
         window = pygame.display.set_mode(
             (WINDOW_WIDTH, WINDOW_HEIGHT),
             pygame.NOFRAME
         )
 
-        # 获取窗口句柄并设置样式
         state.hwnd = pygame.display.get_wm_info()['window']
         state.hwnd_set = True
 
-        # 设置窗口位置和置顶 (确保在主显示器)
         HWND_TOPMOST = -1
-        SWP_NOSIZE = 0x0001
-        SWP_NOMOVE = 0x0002
         SWP_SHOWWINDOW = 0x0040
 
-        # 立即设置位置，确保在主显示器
         windll.user32.SetWindowPos(
-            state.hwnd,
-            HWND_TOPMOST,
+            state.hwnd, HWND_TOPMOST,
             x, y, WINDOW_WIDTH, WINDOW_HEIGHT,
             SWP_SHOWWINDOW
         )
 
-        # 设置圆角和透明
         setup_window(state.hwnd)
-
-        # 初始隐藏
         windll.user32.ShowWindow(state.hwnd, 0)
 
-        # 字体 - 楷体
+        # 字体
         try:
-            font = pygame.freetype.SysFont("KaiTi", 18)
+            font = pygame.freetype.SysFont("KaiTi", 16)
         except Exception:
             try:
-                font = pygame.freetype.SysFont("楷体", 18)
+                font = pygame.freetype.SysFont("楷体", 16)
             except Exception:
-                font = pygame.freetype.SysFont("Microsoft YaHei UI", 16)
+                font = pygame.freetype.SysFont("Microsoft YaHei UI", 14)
 
         clock = pygame.time.Clock()
-        bg_color = (255, 255, 255, 200)  # 白色半透明背景
+        bg_color = (255, 255, 255)
+        bar_color = (100, 140, 220)  # 蓝色波形条
 
         while state.running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    return  # 不设置 running=False，让主循环决定
+                    return
 
-            if state.window_visible and state.status_text:
-                # 绘制背景
-                window.fill(bg_color[:3])  # pygame 不支持 alpha 填充
+            if state.window_visible:
+                window.fill(bg_color)
 
-                # 绘制小龙虾 (趴在右下角)
-                draw_crayfish(window, WINDOW_WIDTH - 25, WINDOW_HEIGHT - 12, 1.0)
+                if state.is_recording:
+                    # --- 波形动画 ---
+                    with _state_lock:
+                        current_rms = state.current_rms
 
-                # 绘制文字 (黑色)
-                text_rect = font.get_rect(state.status_text)
-                text_x = (WINDOW_WIDTH - text_rect.width) // 2
-                text_y = (WINDOW_HEIGHT - text_rect.height) // 2
-                font.render_to(window, (text_x, text_y), state.status_text, state.status_color)
+                    target = min(current_rms * RMS_SCALE, 1.0)
+                    attack = 0.4
+                    release = 0.15
+                    if target > state.rms_smooth:
+                        state.rms_smooth += (target - state.rms_smooth) * attack
+                    else:
+                        state.rms_smooth += (target - state.rms_smooth) * release
+
+                    smoothed = state.rms_smooth
+                    for i, w in enumerate(BAR_WEIGHTS):
+                        jitter = random.uniform(-0.04, 0.04)
+                        bar_h = max(3, int(smoothed * w * (1 + jitter) * BAR_MAX_HEIGHT))
+                        bar_x = BAR_AREA_X + i * (BAR_WIDTH + BAR_GAP)
+                        bar_y = BAR_AREA_Y_CENTER - bar_h // 2
+                        pygame.draw.rect(window, bar_color,
+                                         (bar_x, bar_y, BAR_WIDTH, bar_h),
+                                         border_radius=3)
+
+                    # 右侧文字
+                    elapsed = time.time() - state.record_start_time if state.record_start_time else 0
+                    text = f"收听中 {elapsed:.1f}s"
+                    text_rect = font.get_rect(text)
+                    text_x = BAR_AREA_X + BAR_COUNT * (BAR_WIDTH + BAR_GAP) + 12
+                    text_y = (WINDOW_HEIGHT - text_rect.height) // 2
+                    font.render_to(window, (text_x, text_y), text, (80, 80, 80))
+                else:
+                    # --- 普通状态文字 ---
+                    text = state.status_text
+                    if text:
+                        text_rect = font.get_rect(text)
+                        text_x = (WINDOW_WIDTH - text_rect.width) // 2
+                        text_y = (WINDOW_HEIGHT - text_rect.height) // 2
+                        font.render_to(window, (text_x, text_y), text, state.status_color)
 
                 pygame.display.flip()
 
@@ -321,29 +286,25 @@ def pygame_window_thread():
 
 
 def show_status(message, color=(50, 50, 50)):
-    """显示状态 - 确保只在主显示器显示"""
+    """显示状态"""
     state.status_text = message
     state.status_color = color
     state.window_visible = True
     if state.hwnd:
-        # 每次显示时重新定位到主显示器中心
         SM_CXSCREEN = 0
         screen_width = windll.user32.GetSystemMetrics(SM_CXSCREEN)
         x = (screen_width - WINDOW_WIDTH) // 2
-        y = 80
 
         HWND_TOPMOST = -1
-        SWP_NOSIZE = 0x0001
         SWP_NOZORDER = 0x0004
         SWP_SHOWWINDOW = 0x0040
 
         windll.user32.SetWindowPos(
-            state.hwnd,
-            HWND_TOPMOST,
-            x, y, 0, 0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW
+            state.hwnd, HWND_TOPMOST,
+            x, 80, 0, 0,
+            0x0001 | SWP_NOZORDER | SWP_SHOWWINDOW
         )
-        windll.user32.ShowWindow(state.hwnd, 5)  # SW_SHOW
+        windll.user32.ShowWindow(state.hwnd, 5)
 
 
 def hide_status():
@@ -355,7 +316,6 @@ def hide_status():
 
 
 # ========== 声音反馈 ==========
-
 def play_beep(freq, duration):
     try:
         import winsound
@@ -365,7 +325,6 @@ def play_beep(freq, duration):
 
 
 # ========== 录音模块 ==========
-
 def start_recording():
     with _state_lock:
         if state.is_recording or state.processing:
@@ -373,17 +332,22 @@ def start_recording():
 
     try:
         import sounddevice as sd
+        import numpy as np
 
         with _state_lock:
             state.is_recording = True
             state.audio_data = []
             state.record_start_time = time.time()
+            state.current_rms = 0.0
+            state.rms_smooth = 0.0
 
         def callback(indata, frames, time_info, cb_status):
             if cb_status:
                 log.warning(str(cb_status))
             with _state_lock:
                 state.audio_data.append(indata.copy())
+                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                state.current_rms = rms
 
         state.stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -395,16 +359,8 @@ def start_recording():
 
         play_beep(800, 80)
         play_beep(1000, 80)
-        show_status("🎤 正在收听...", (80, 80, 80))
+        show_status("正在收听...", (80, 80, 80))
         log.info("正在收听...")
-
-        def update_timer():
-            while state.is_recording:
-                elapsed = time.time() - state.record_start_time
-                show_status(f"🎤 收听中 {elapsed:.1f}s", (80, 80, 80))
-                time.sleep(0.1)
-
-        threading.Thread(target=update_timer, daemon=True).start()
 
     except Exception as e:
         log.error(f"录音失败: {e}", exc_info=True)
@@ -438,7 +394,7 @@ def stop_recording():
         if duration < 0.3:
             log.warning(f"录音太短: {duration:.1f}s")
             play_beep(400, 200)
-            show_status("❌ 太短", (200, 50, 50))
+            show_status("太短了", (200, 50, 50))
             time.sleep(1)
             hide_status()
             return None
@@ -449,7 +405,7 @@ def stop_recording():
 
         play_beep(1000, 80)
         play_beep(600, 120)
-        show_status("🔄 识别中...", (100, 100, 100))
+        show_status("识别中...", (100, 100, 100))
         log.info(f"录音完成: {duration:.1f}s")
 
         return tmp.name
@@ -462,11 +418,9 @@ def stop_recording():
 
 def find_coli():
     """查找 coli 可执行文件路径"""
-    # 优先从 PATH 查找
     coli_path = shutil.which("coli")
     if coli_path:
         return coli_path
-    # 常见路径 fallback
     npm_coli = Path(os.environ.get("APPDATA", "")) / "npm" / "coli.cmd"
     if npm_coli.exists():
         return str(npm_coli)
@@ -500,6 +454,54 @@ def recognize(audio_path):
         return ""
 
 
+# ========== LLM 纠错 ==========
+LLM_SYSTEM_PROMPT = """你是一个语音识别纠错助手。请非常保守地纠错：
+- 只修复明显的语音识别错误（如中文谐音错误、英文技术术语被错转中文如"配森"→"Python"、"杰森"→"JSON"）
+- 绝对不要改写、润色或删除任何看起来正确的内容
+- 如果输入看起来正确，原样返回
+- 只返回纠错后的文本，不要任何解释"""
+
+
+def refine_with_llm(text):
+    """调用 LLM 纠正语音识别错误"""
+    if not LLM_API_KEY or not text:
+        return text
+
+    try:
+        url = f"{LLM_API_BASE_URL.rstrip('/')}/chat/completions"
+        data = {
+            "model": LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": text}
+            ],
+            "temperature": 0.1,
+            "max_tokens": len(text) * 2
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {LLM_API_KEY}"
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            refined = result["choices"][0]["message"]["content"].strip()
+            if refined:
+                log.info(f"LLM 纠错: '{text}' -> '{refined}'")
+                return refined
+            return text
+
+    except Exception as e:
+        log.warning(f"LLM 纠错失败，使用原文: {e}")
+        return text
+
+
 def add_punctuation(text):
     if not text:
         return text
@@ -512,13 +514,61 @@ def add_punctuation(text):
     return text
 
 
+# ========== 剪贴板管理 ==========
+def save_clipboard():
+    """保存当前剪贴板内容"""
+    try:
+        import win32clipboard
+        import win32con
+
+        win32clipboard.OpenClipboard()
+        try:
+            if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                return text
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        pass
+    return None
+
+
+def restore_clipboard(text):
+    """恢复剪贴板内容"""
+    if text is None:
+        return
+    try:
+        import win32clipboard
+        import win32con
+
+        time.sleep(0.3)  # 等粘贴完成
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception as e:
+        log.warning(f"恢复剪贴板失败: {e}")
+
+
+# ========== 文字注入 ==========
 def type_text(text):
-    """通过剪贴板粘贴输入文字"""
+    """通过剪贴板粘贴输入文字（含剪贴板恢复 + IME 处理）"""
     if not text:
         return
     try:
         import win32clipboard
         import win32con
+
+        # 保存原剪贴板
+        saved_clip = save_clipboard()
+
+        # 发 Escape 取消可能存在的 IME 组字状态
+        KEYEVENTF_KEYUP = 0x0002
+        windll.user32.keybd_event(0x1B, 0, 0, 0)  # VK_ESCAPE
+        windll.user32.keybd_event(0x1B, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(0.05)
 
         # 写入剪贴板
         win32clipboard.OpenClipboard()
@@ -527,8 +577,7 @@ def type_text(text):
         win32clipboard.CloseClipboard()
 
         # 模拟 Ctrl+V 粘贴
-        time.sleep(0.15)
-        KEYEVENTF_KEYUP = 0x0002
+        time.sleep(0.1)
         windll.user32.keybd_event(0x11, 0, 0, 0)  # VK_CONTROL
         windll.user32.keybd_event(0x56, 0, 0, 0)  # VK_V
         windll.user32.keybd_event(0x56, 0, KEYEVENTF_KEYUP, 0)
@@ -537,12 +586,16 @@ def type_text(text):
         log.info(f"已输入: ({len(text)}字)")
         play_beep(1000, 50)
         play_beep(1200, 80)
+
+        # 恢复原剪贴板
+        restore_clipboard(saved_clip)
+
     except Exception as e:
         log.error(f"输入失败: {e}", exc_info=True)
 
 
 def process_audio(audio_path):
-    """普通模式：识别后打字"""
+    """普通模式：识别 → LLM纠错 → 打字"""
     with _state_lock:
         if state.processing:
             return
@@ -550,16 +603,21 @@ def process_audio(audio_path):
     try:
         text = recognize(audio_path)
         if text:
+            # LLM 纠错
+            if state.llm_enabled and LLM_API_KEY:
+                show_status("AI 纠错中...", (100, 100, 200))
+                text = refine_with_llm(text)
+
             text = add_punctuation(text)
             display = text[:20] + "..." if len(text) > 20 else text
-            show_status(f"✅ {display}", (50, 150, 50))
+            show_status(f"OK {display}", (50, 150, 50))
             play_beep(1000, 50)
             play_beep(1200, 80)
             type_text(text)
             time.sleep(1.5)
             hide_status()
         else:
-            show_status("❌ 识别失败", (200, 50, 50))
+            show_status("识别失败", (200, 50, 50))
             play_beep(400, 200)
             time.sleep(1)
             hide_status()
@@ -572,8 +630,7 @@ def process_audio(audio_path):
 
 
 # ========== Get笔记 API ==========
-# 语音笔记知识库 ID (可在 Get笔记 App 中查看)
-VOICE_NOTE_TOPIC_ID = "EJXjKbqY"  # "语音笔记" 知识库
+VOICE_NOTE_TOPIC_ID = "EJXjKbqY"
 
 def save_to_getnote(text):
     """保存文字到 Get笔记"""
@@ -582,16 +639,11 @@ def save_to_getnote(text):
         return False, "API未配置"
 
     try:
-        # 生成标题（取前20字）
         title = text[:20] + "..." if len(text) > 20 else text
         title = title.replace("\n", " ").strip()
 
-        # 提取标签（#开头的词）
-        tags = []
         import re
-        tag_matches = re.findall(r'#(\S+)', text)
-        if tag_matches:
-            tags = tag_matches[:5]  # 最多5个标签
+        tags = re.findall(r'#(\S+)', text)[:5]
 
         data = {
             "title": title,
@@ -617,18 +669,11 @@ def save_to_getnote(text):
 
             if result.get("success"):
                 log.info(f"已保存到 Get笔记: {title}")
-
-                # 获取 note_id (64位整数，用正则提取避免精度丢失)
-                # API 返回的字段可能是 "id" 或 "note_id"
+                import re
                 note_id_match = re.search(r'"(?:note_)?id"\s*:\s*(\d+)', raw_data)
                 note_id = int(note_id_match.group(1)) if note_id_match else None
-
-                log.debug(f"note_id: {note_id}")
-
-                # 添加到知识库
                 if note_id and VOICE_NOTE_TOPIC_ID:
                     add_note_to_topic(note_id, VOICE_NOTE_TOPIC_ID)
-
                 return True, title
             else:
                 error = result.get("error", {})
@@ -663,15 +708,12 @@ def add_note_to_topic(note_id, topic_id):
             result = json.loads(response.read().decode("utf-8"))
             if result.get("success"):
                 log.info("已添加到知识库")
-            else:
-                log.warning(f"添加到知识库失败: {result.get('error', {}).get('message', '')}")
-
     except Exception as e:
         log.warning(f"添加到知识库异常: {e}")
 
 
 def process_audio_for_note(audio_path):
-    """笔记模式：识别后保存到 Get笔记"""
+    """笔记模式：识别 → LLM纠错 → 保存到 Get笔记"""
     with _state_lock:
         if state.processing:
             return
@@ -679,26 +721,29 @@ def process_audio_for_note(audio_path):
     try:
         text = recognize(audio_path)
         if text:
+            # LLM 纠错
+            if state.llm_enabled and LLM_API_KEY:
+                show_status("AI 纠错中...", (100, 100, 200))
+                text = refine_with_llm(text)
+
             text = add_punctuation(text)
             display = text[:15] + "..." if len(text) > 15 else text
-            show_status(f"📝 {display}", (100, 100, 200))
+            show_status(f"Note {display}", (100, 100, 200))
             play_beep(800, 80)
 
-            # 保存到 Get笔记
             success, msg = save_to_getnote(text)
-
             if success:
-                show_status(f"✅ 笔记已保存", (50, 150, 50))
+                show_status("笔记已保存", (50, 150, 50))
                 play_beep(1000, 50)
                 play_beep(1200, 80)
             else:
-                show_status(f"❌ {msg[:10]}", (200, 50, 50))
+                show_status(f"失败 {msg[:10]}", (200, 50, 50))
                 play_beep(400, 200)
 
             time.sleep(1.5)
             hide_status()
         else:
-            show_status("❌ 识别失败", (200, 50, 50))
+            show_status("识别失败", (200, 50, 50))
             play_beep(400, 200)
             time.sleep(1)
             hide_status()
@@ -712,7 +757,6 @@ def process_audio_for_note(audio_path):
 
 
 # ========== 系统托盘 ==========
-
 def create_tray_icon():
     """加载项目图标作为托盘图标"""
     from PIL import Image
@@ -720,28 +764,41 @@ def create_tray_icon():
     if icon_path.exists():
         image = Image.open(icon_path)
         return image.resize((64, 64), Image.LANCZOS)
-    # fallback: 红色圆点
     from PIL import ImageDraw
     image = Image.new('RGB', (64, 64), (255, 255, 255))
     draw = ImageDraw.Draw(image)
     draw.ellipse([8, 8, 56, 56], fill=(220, 80, 60))
     return image
 
+
 def on_tray_quit(icon, item):
-    """托盘退出"""
     state.running = False
     icon.stop()
+
+
+def on_toggle_llm(icon, item):
+    state.llm_enabled = not state.llm_enabled
+    icon.notify(f"LLM 纠错已{'开启' if state.llm_enabled else '关闭'}")
+
 
 def tray_thread():
     """系统托盘线程"""
     try:
         import pystray
+
+        llm_status = "已配置" if LLM_API_KEY else "未配置API Key"
         icon = pystray.Icon(
             "Voice Typer",
             create_tray_icon(),
-            "Voice Typer v3.6",
+            "Voice Typer v3.7",
             menu=pystray.Menu(
-                pystray.MenuItem("Voice Typer v3.6", None, enabled=False),
+                pystray.MenuItem("Voice Typer v3.7", None, enabled=False),
+                pystray.MenuItem(f"LLM纠错 ({llm_status})", None, enabled=False),
+                pystray.MenuItem(
+                    "启用 LLM 纠错",
+                    on_toggle_llm,
+                    checked=lambda item: state.llm_enabled
+                ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("退出", on_tray_quit),
             )
@@ -753,16 +810,20 @@ def tray_thread():
 
 def main():
     log.info("=" * 50)
-    log.info("Voice Typer v3.6 (玻璃透明版 + Get笔记 + 系统托盘)")
+    log.info("Voice Typer v3.7 (LLM纠错 + 波形动画 + 剪贴板恢复)")
     log.info("=" * 50)
     log.info("快捷键: Alt+C=打字, Alt+V=笔记, 托盘退出")
     log.info(f"日志文件: {LOG_FILE}")
 
-    # 检查 Get笔记配置
     if GETNOTE_API_KEY:
         log.info("Get笔记 API 已配置")
     else:
         log.warning("Get笔记 API 未配置")
+
+    if LLM_API_KEY:
+        log.info(f"LLM 纠错已配置: {LLM_API_BASE_URL} / {LLM_MODEL}")
+    else:
+        log.warning("LLM API Key 未配置，纠错功能不可用")
 
     # 启动系统托盘
     threading.Thread(target=tray_thread, daemon=True).start()
@@ -779,7 +840,6 @@ def main():
     # 主循环
     while state.running:
         try:
-            # 检测 Alt + V (笔记模式) - 优先检测
             alt_v = is_alt_v_pressed()
             alt_c = is_alt_c_pressed()
 
@@ -794,7 +854,6 @@ def main():
                     audio_path = stop_recording()
                     if audio_path:
                         threading.Thread(target=process_audio_for_note, args=(audio_path,), daemon=True).start()
-                # Alt + C (打字模式)
                 elif alt_c:
                     if not state.last_key_state:
                         state.last_key_state = True
@@ -807,13 +866,13 @@ def main():
                         if audio_path:
                             threading.Thread(target=process_audio, args=(audio_path,), daemon=True).start()
 
-            time.sleep(0.02)  # 50Hz 检测频率
+            time.sleep(0.02)
 
         except Exception as e:
             log.error(f"主循环异常: {e}", exc_info=True)
             time.sleep(0.5)
 
-    # 优雅退出：关闭单实例锁
+    # 优雅退出
     global _instance_lock
     if _instance_lock:
         _instance_lock.close()
