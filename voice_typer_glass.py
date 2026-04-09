@@ -202,6 +202,7 @@ def pygame_window_thread():
 
         state.hwnd = pygame.display.get_wm_info()['window']
         state.hwnd_set = True
+        log.info("玻璃窗口已启动 (hwnd=%s)", state.hwnd)
 
         HWND_TOPMOST = -1
         SWP_SHOWWINDOW = 0x0040
