@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Voice Typer v3.7 - LLM纠错 + 波形动画 + 剪贴板恢复
-按住 Alt+C 说话，松开自动打字
-按住 Alt+V 说话，松开保存到 Get笔记
+Voice Typer v3.8 - LLM纠错 + 波形动画 + 剪贴板恢复
+按住 RightAlt 说话，松开自动打字
+按住 RightAlt+M 说话，松开保存到 Get笔记
 右键托盘图标退出 / 切换LLM纠错
+改进: SetWindowsHookEx 键盘钩子 + 音频预热 + 事件队列
 """
 
 import os
@@ -14,14 +15,17 @@ import shutil
 import threading
 import time
 import ctypes
+import ctypes.wintypes
+import queue
 import tempfile
 import json
 import random
 import logging
+import logging.handlers
 import urllib.request
 import urllib.error
 from pathlib import Path
-from ctypes import windll, c_int, byref, sizeof
+from ctypes import windll, c_int, byref, sizeof, wintypes
 
 # ========== 日志配置 ==========
 LOG_FILE = Path(tempfile.gettempdir()) / "voice_typer.log"
@@ -29,7 +33,9 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=512_000, backupCount=1, encoding='utf-8'
+        ),
     ]
 )
 log = logging.getLogger(__name__)
@@ -52,13 +58,20 @@ _instance_lock = check_single_instance()
 # Windows 虚拟键码
 VK_LMENU = 0xA4  # 左 Alt
 VK_RMENU = 0xA5  # 右 Alt
-VK_V = 0x56      # V 键
-VK_C = 0x43      # C 键
+VK_M = 0x4D      # M 键
+
+# ========== 应用目录 ==========
+def get_app_dir():
+    """获取应用目录（兼容 PyInstaller 打包）"""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
 
 # ========== API 配置 ==========
 def load_config():
     """加载所有配置"""
-    env_path = Path(__file__).parent / ".env"
+    env_path = get_app_dir() / ".env"
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -104,8 +117,6 @@ class State:
     is_recording = False
     audio_data = []
     stream = None
-    last_key_state = False
-    last_alt_v_state = False
     record_start_time = None
     running = True
     status_text = ""
@@ -124,34 +135,134 @@ class State:
 state = State()
 
 
-# ========== 按键检测 (Windows API) ==========
-def is_left_alt_pressed():
-    """使用 Windows API 精确检测左 Alt 键状态"""
-    result = windll.user32.GetAsyncKeyState(VK_LMENU)
-    return result & 0x8000 != 0
+# ========== 键盘钩子 (SetWindowsHookEx) ==========
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
 
-def is_right_alt_pressed():
-    """检测右 Alt 键状态"""
-    result = windll.user32.GetAsyncKeyState(VK_RMENU)
-    return result & 0x8000 != 0
+# 64-bit 兼容类型
+LRESULT = ctypes.c_longlong
 
-def is_v_pressed():
-    """检测 V 键状态"""
-    result = windll.user32.GetAsyncKeyState(VK_V)
-    return result & 0x8000 != 0
 
-def is_alt_v_pressed():
-    """检测 Alt + V 组合键"""
-    return is_left_alt_pressed() and not is_right_alt_pressed() and is_v_pressed()
+def _setup_ctypes_64bit():
+    """为 64-bit Windows 设置正确的 ctypes 函数签名"""
+    windll.kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+    windll.kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+    windll.user32.SetWindowsHookExW.restype = ctypes.c_void_p
+    windll.user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD
+    ]
+    windll.user32.CallNextHookEx.restype = LRESULT
+    windll.user32.CallNextHookEx.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+    ]
+    windll.user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    windll.user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 
-def is_c_pressed():
-    """检测 C 键状态"""
-    result = windll.user32.GetAsyncKeyState(VK_C)
-    return result & 0x8000 != 0
 
-def is_alt_c_pressed():
-    """检测 Alt + C 组合键"""
-    return is_left_alt_pressed() and not is_right_alt_pressed() and is_c_pressed()
+_setup_ctypes_64bit()
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ('vkCode', wintypes.DWORD),
+        ('scanCode', wintypes.DWORD),
+        ('flags', wintypes.DWORD),
+        ('time', wintypes.DWORD),
+        ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+HOOKPROC = ctypes.CFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+# 事件类型
+EVT_TYPE_DOWN = 'type_down'
+EVT_TYPE_UP = 'type_up'
+EVT_NOTE_DOWN = 'note_down'
+EVT_NOTE_UP = 'note_up'
+
+_key_queue = queue.Queue()
+
+# 钩子回调必须保持为全局变量防止 GC
+_hook_callback = None
+_hook_handle = None
+
+
+def _keyboard_hook_proc(nCode, wParam, lParam):
+    """底层键盘钩子回调 — RightAlt=打字, RightAlt+M=笔记"""
+    if nCode >= 0:
+        kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+        vk = kb.vkCode
+        is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
+
+        if is_down:
+            if vk == VK_RMENU:
+                if not _hook_state['ralt'] and not _hook_state['m']:
+                    # RightAlt 单独按下 → 开始打字模式
+                    _key_queue.put(EVT_TYPE_DOWN)
+                _hook_state['ralt'] = True
+            elif vk == VK_M:
+                if _hook_state['ralt']:
+                    # RightAlt+M → 切换到笔记模式
+                    _key_queue.put(EVT_NOTE_DOWN)
+                _hook_state['m'] = True
+
+        elif is_up:
+            if vk == VK_RMENU:
+                if _hook_state['recording_type']:
+                    _key_queue.put(EVT_TYPE_UP)
+                if _hook_state['recording_note']:
+                    _key_queue.put(EVT_NOTE_UP)
+                _hook_state['ralt'] = False
+            elif vk == VK_M:
+                _hook_state['m'] = False
+
+    return windll.user32.CallNextHookEx(0, nCode, wParam, lParam)
+
+
+# 钩子状态
+_hook_state = {
+    'ralt': False, 'm': False,
+    'recording_type': False, 'recording_note': False,
+}
+
+
+def _hook_thread_func():
+    """键盘钩子线程 — 安装钩子并运行消息循环"""
+    global _hook_callback, _hook_handle
+
+    _hook_callback = HOOKPROC(_keyboard_hook_proc)
+    hmod = windll.kernel32.GetModuleHandleW(None)
+    _hook_handle = windll.user32.SetWindowsHookExW(
+        WH_KEYBOARD_LL, ctypes.cast(_hook_callback, ctypes.c_void_p), hmod, 0
+    )
+
+    if not _hook_handle:
+        err = windll.kernel32.GetLastError()
+        log.error(f"键盘钩子安装失败 (err={err})")
+        return
+
+    log.info("键盘钩子已安装 (SetWindowsHookEx)")
+
+    msg = wintypes.MSG()
+    while windll.user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
+        windll.user32.TranslateMessage(ctypes.byref(msg))
+        windll.user32.DispatchMessageW(ctypes.byref(msg))
+
+    if _hook_handle:
+        windll.user32.UnhookWindowsHookEx(_hook_handle)
+        _hook_handle = None
+    log.info("键盘钩子已卸载")
+
+
+def start_keyboard_hook():
+    """启动键盘钩子线程"""
+    t = threading.Thread(target=_hook_thread_func, daemon=True)
+    t.start()
+    return t
 
 
 # ========== Windows API 设置圆角和透明 ==========
@@ -297,13 +408,13 @@ def show_status(message, color=(50, 50, 50)):
         x = (screen_width - WINDOW_WIDTH) // 2
 
         HWND_TOPMOST = -1
-        SWP_NOZORDER = 0x0004
+        SWP_NOSIZE = 0x0001
         SWP_SHOWWINDOW = 0x0040
 
         windll.user32.SetWindowPos(
             state.hwnd, HWND_TOPMOST,
             x, 80, 0, 0,
-            0x0001 | SWP_NOZORDER | SWP_SHOWWINDOW
+            SWP_NOSIZE | SWP_SHOWWINDOW
         )
         windll.user32.ShowWindow(state.hwnd, 5)
 
@@ -761,14 +872,19 @@ def process_audio_for_note(audio_path):
 def create_tray_icon():
     """加载项目图标作为托盘图标"""
     from PIL import Image
-    icon_path = Path(__file__).parent / "assets" / "icon.png"
-    if icon_path.exists():
-        image = Image.open(icon_path)
-        return image.resize((64, 64), Image.LANCZOS)
+    app_dir = get_app_dir()
+    for name in ("icon_preview.png", "assets/icon_preview.png", "icon.png", "assets/icon.png"):
+        icon_path = app_dir / name
+        if icon_path.exists():
+            try:
+                image = Image.open(icon_path).convert("RGBA")
+                return image.resize((64, 64), Image.LANCZOS)
+            except Exception as e:
+                log.warning(f"图标加载失败 {icon_path}: {e}")
     from PIL import ImageDraw
-    image = Image.new('RGB', (64, 64), (255, 255, 255))
+    image = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.ellipse([8, 8, 56, 56], fill=(220, 80, 60))
+    draw.ellipse([8, 8, 56, 56], fill=(100, 140, 220))
     return image
 
 
@@ -791,9 +907,9 @@ def tray_thread():
         icon = pystray.Icon(
             "Voice Typer",
             create_tray_icon(),
-            "Voice Typer v3.7",
+            "Voice Typer v3.8",
             menu=pystray.Menu(
-                pystray.MenuItem("Voice Typer v3.7", None, enabled=False),
+                pystray.MenuItem("Voice Typer v3.8", None, enabled=False),
                 pystray.MenuItem(f"LLM纠错 ({llm_status})", None, enabled=False),
                 pystray.MenuItem(
                     "启用 LLM 纠错",
@@ -809,11 +925,22 @@ def tray_thread():
         log.error(f"托盘线程异常: {e}", exc_info=True)
 
 
+def prewarm_audio():
+    """预热音频设备 — 提前加载 sounddevice + 初始化 PortAudio"""
+    try:
+        import sounddevice as sd
+        # 触发 PortAudio 初始化，后续 start_recording 更快
+        _ = sd.query_devices()
+        log.info("音频设备预热完成")
+    except Exception as e:
+        log.warning(f"音频预热失败 (非致命): {e}")
+
+
 def main():
     log.info("=" * 50)
-    log.info("Voice Typer v3.7 (LLM纠错 + 波形动画 + 剪贴板恢复)")
+    log.info("Voice Typer v3.8 (键盘钩子 + LLM纠错 + 波形动画)")
     log.info("=" * 50)
-    log.info("快捷键: Alt+C=打字, Alt+V=笔记, 托盘退出")
+    log.info("快捷键: RightAlt=打字, RightAlt+M=笔记, 托盘退出")
     log.info(f"日志文件: {LOG_FILE}")
 
     if GETNOTE_API_KEY:
@@ -833,47 +960,67 @@ def main():
     # 启动 pygame 窗口线程
     threading.Thread(target=pygame_window_thread, daemon=True).start()
 
+    # 预热音频设备
+    threading.Thread(target=prewarm_audio, daemon=True).start()
+
+    # 启动键盘钩子
+    start_keyboard_hook()
+
     # 等待 pygame 初始化
     time.sleep(0.5)
 
-    log.info("快捷键监听已启动")
+    log.info("键盘钩子事件循环已就绪")
 
-    # 主循环
+    # 主循环 — 事件队列驱动，无轮询
     while state.running:
         try:
-            alt_v = is_alt_v_pressed()
-            alt_c = is_alt_c_pressed()
+            event = _key_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
 
-            if alt_v:
-                if not state.last_alt_v_state:
-                    state.last_alt_v_state = True
-                    state.note_mode = True
+        try:
+            if event == EVT_TYPE_DOWN:
+                if not state.is_recording and not state.processing:
+                    _hook_state['recording_type'] = True
+                    _hook_state['recording_note'] = False
+                    state.note_mode = False
                     start_recording()
-            else:
-                if state.last_alt_v_state:
-                    state.last_alt_v_state = False
+
+            elif event == EVT_TYPE_UP:
+                _hook_state['recording_type'] = False
+                if state.is_recording and not state.note_mode:
                     audio_path = stop_recording()
                     if audio_path:
-                        threading.Thread(target=process_audio_for_note, args=(audio_path,), daemon=True).start()
-                elif alt_c:
-                    if not state.last_key_state:
-                        state.last_key_state = True
-                        state.note_mode = False
-                        start_recording()
-                else:
-                    if state.last_key_state and not state.note_mode:
-                        state.last_key_state = False
-                        audio_path = stop_recording()
-                        if audio_path:
-                            threading.Thread(target=process_audio, args=(audio_path,), daemon=True).start()
+                        threading.Thread(
+                            target=process_audio, args=(audio_path,), daemon=True
+                        ).start()
 
-            time.sleep(0.02)
+            elif event == EVT_NOTE_DOWN:
+                if not state.is_recording and not state.processing:
+                    _hook_state['recording_note'] = True
+                    _hook_state['recording_type'] = False
+                    state.note_mode = True
+                    start_recording()
+
+            elif event == EVT_NOTE_UP:
+                _hook_state['recording_note'] = False
+                if state.is_recording and state.note_mode:
+                    audio_path = stop_recording()
+                    if audio_path:
+                        threading.Thread(
+                            target=process_audio_for_note, args=(audio_path,), daemon=True
+                        ).start()
 
         except Exception as e:
-            log.error(f"主循环异常: {e}", exc_info=True)
-            time.sleep(0.5)
+            log.error(f"事件处理异常: {e}", exc_info=True)
 
     # 优雅退出
+    if state.stream:
+        try:
+            state.stream.stop()
+            state.stream.close()
+        except Exception:
+            pass
     global _instance_lock
     if _instance_lock:
         _instance_lock.close()
